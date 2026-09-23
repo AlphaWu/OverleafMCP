@@ -120,7 +120,7 @@ If `projectName` is omitted, the `default` entry is used. To put `projects.json`
 
 The server picks the **first** matching configuration source:
 
-1. **Env vars (single project)** — `OVERLEAF_PROJECT_ID` + `OVERLEAF_GIT_TOKEN`. Optional: `OVERLEAF_PROJECT_NAME` for the display name.
+1. **Env vars (single project)** — `OVERLEAF_PROJECT_ID` + `OVERLEAF_GIT_TOKEN`. Optional: `OVERLEAF_PROJECT_NAME` for the display name, `OVERLEAF_SERVER_URL` for a self-hosted instance (see below).
 2. **Token from a file** — set `OVERLEAF_PROJECT_ID` together with `OVERLEAF_GIT_TOKEN_FILE=/path/to/token.txt` (instead of `OVERLEAF_GIT_TOKEN`). Useful when you don't want the token in the Claude Desktop JSON. The file is read once at startup and any trailing whitespace/newline is trimmed.
 3. **Multi-project file** — `OVERLEAF_PROJECTS_CONFIG=/absolute/path/projects.json`.
 4. **User config dir** — `projects.json` in:
@@ -145,12 +145,28 @@ When env vars are set and a file is also present, env vars win and a notice is l
       "name": "Second Paper",
       "projectId": "...",
       "gitToken": "olp_..."
+    },
+    "zafu": {
+      "name": "Paper on a Self-Hosted Instance",
+      "projectId": "...",
+      "gitToken": "...",
+      "serverUrl": "https://latex.example.edu"
     }
   }
 }
 ```
 
 Then specify the project in tool calls: `projectName: "paper2"`.
+
+### Self-hosted Overleaf instances
+
+By default the server talks to official Overleaf (`https://git.overleaf.com`). To use a self-hosted instance (e.g. a university deployment such as `https://latex.zafu.edu.cn`), set `serverUrl` in `projects.json` or `OVERLEAF_SERVER_URL` in env-var mode:
+
+- The value is normalized to its origin — a project URL like `https://latex.example.edu/project/<id>` works too; only the `https://latex.example.edu` part is used.
+- Git is expected at `<serverUrl>/git/<projectId>`, matching the standard self-hosted layout (`git clone https://git@latex.example.edu/git/<id>`). The git token is injected as the HTTP password, same as for overleaf.com.
+- `serverUrl` must be `http(s)` and must not contain credentials — the token is always supplied separately.
+- Clones from different servers are kept in separate local directories, so the same project ID on two servers never collides.
+- `list_projects` reports each project's `serverUrl` (`https://www.overleaf.com` when unset) so mixed setups stay distinguishable.
 
 ## Local Development
 
@@ -181,12 +197,34 @@ Then point Claude Desktop at the script and pass credentials via env vars (the s
 }
 ```
 
+For a self-hosted instance, add `"OVERLEAF_SERVER_URL": "https://latex.example.edu"` to the same `env` block.
+
 On Windows, `args` should use `"C:\\Users\\you\\OverleafMCP\\overleaf-mcp-server.js"`.
 
 If you'd rather use a multi-project file:
 
 ```bash
 cp projects.example.json projects.json   # then edit it
+```
+
+A filled-in `projects.json` mixing an official project and a self-hosted one looks like this — put `serverUrl` on the self-hosted entry only:
+
+```json
+{
+  "projects": {
+    "default": {
+      "name": "My Paper",
+      "projectId": "YOUR_PROJECT_ID",
+      "gitToken": "olp_..."
+    },
+    "zafu": {
+      "name": "ZAFU Paper",
+      "projectId": "YOUR_SELF_HOSTED_PROJECT_ID",
+      "gitToken": "YOUR_SELF_HOSTED_GIT_TOKEN",
+      "serverUrl": "https://latex.zafu.edu.cn"
+    }
+  }
+}
 ```
 
 `projects.json` next to the script is the lowest-priority fallback, so this still works without env vars.

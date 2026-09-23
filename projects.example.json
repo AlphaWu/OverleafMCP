@@ -7,8 +7,14 @@
     },
     "project2": {
       "name": "Another Paper",
-      "projectId": "ANOTHER_PROJECT_ID", 
+      "projectId": "ANOTHER_PROJECT_ID",
       "gitToken": "ANOTHER_GIT_TOKEN"
+    },
+    "self-hosted": {
+      "name": "Paper on a Self-Hosted Instance",
+      "projectId": "SELF_HOSTED_PROJECT_ID",
+      "gitToken": "SELF_HOSTED_GIT_TOKEN",
+      "serverUrl": "https://latex.example.edu"
     }
   }
 }

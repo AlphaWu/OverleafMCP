@@ -22,7 +22,7 @@ const execFileP = promisify(execFileCallback);
 
 // Strip the Overleaf git token from any string that may leak into errors/output
 const maskToken = (s) =>
-  String(s ?? '').replace(/https:\/\/git:[^@\s]+@/g, 'https://git:***@');
+  String(s ?? '').replace(/(https?:\/\/)git:[^@\s]+@/g, '$1git:***@');
 
 // Pure parser for LaTeX sectioning commands. Brace-balanced so titles with
 // nested macros (e.g. \section{Use of \emph{X}}) are captured correctly.
@@ -61,6 +61,8 @@ function parseSections(content) {
 //   1. OVERLEAF_PROJECT_ID + (OVERLEAF_GIT_TOKEN | OVERLEAF_GIT_TOKEN_FILE)
 //      → synthesize a single-project config under the key `default`.
 //      OVERLEAF_PROJECT_NAME is optional and only sets the display name.
+//      OVERLEAF_SERVER_URL is optional and points at a self-hosted Overleaf
+//      instance (e.g. https://latex.example.edu); omit it for overleaf.com.
 //   2. OVERLEAF_PROJECTS_CONFIG=/path/to/projects.json
 //   3. <user config dir>/overleaf-mcp/projects.json
 //        - Windows: %APPDATA%/overleaf-mcp/projects.json
@@ -115,6 +117,52 @@ function validateProject(project, sourceLabel) {
   }
 }
 
+// Normalize a user-supplied server URL down to its origin (scheme + host +
+// port). Returns null when unset. Self-hosted Overleaf instances are addressed
+// by origin only — a path or embedded credentials are a configuration error.
+function normalizeServerUrl(raw, sourceLabel) {
+  const trimmed = String(raw ?? '').trim();
+  if (!trimmed) return null;
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    console.error(
+      `[overleaf-mcp] FATAL: serverUrl from ${sourceLabel} is not a valid URL ` +
+        `(got ${JSON.stringify(trimmed)}). Use an origin like https://latex.example.edu`
+    );
+    process.exit(1);
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    console.error(
+      `[overleaf-mcp] FATAL: serverUrl from ${sourceLabel} must use http(s) ` +
+        `(got ${JSON.stringify(trimmed)}).`
+    );
+    process.exit(1);
+  }
+  if (parsed.username || parsed.password) {
+    console.error(
+      `[overleaf-mcp] FATAL: serverUrl from ${sourceLabel} must not contain credentials ` +
+        `— the git token is supplied separately via gitToken / OVERLEAF_GIT_TOKEN.`
+    );
+    process.exit(1);
+  }
+  if (/\s/.test(trimmed)) {
+    console.error(
+      `[overleaf-mcp] FATAL: serverUrl from ${sourceLabel} contains whitespace ` +
+        `(got ${JSON.stringify(trimmed)}).`
+    );
+    process.exit(1);
+  }
+  if (parsed.protocol === 'http:') {
+    console.error(
+      `[overleaf-mcp] Warning: serverUrl from ${sourceLabel} uses plain http — ` +
+        `the git token will be transmitted unencrypted.`
+    );
+  }
+  return parsed.origin;
+}
+
 async function tryLoadFile(filePath) {
   try {
     const raw = await readFile(filePath, 'utf-8');
@@ -147,10 +195,13 @@ function validateConfigShape(data, sourceLabel) {
     );
     process.exit(1);
   }
+  const projects = {};
   for (const [key, p] of Object.entries(data.projects)) {
-    validateProject(p, `${sourceLabel} → projects.${key}`);
+    const label = `${sourceLabel} → projects.${key}`;
+    validateProject(p, label);
+    projects[key] = { ...p, serverUrl: normalizeServerUrl(p.serverUrl, label) };
   }
-  return data;
+  return { ...data, projects };
 }
 
 async function loadProjectsConfig() {
@@ -181,6 +232,7 @@ async function loadProjectsConfig() {
       name: process.env.OVERLEAF_PROJECT_NAME?.trim() || 'Overleaf Project',
       projectId: envId,
       gitToken: envTok.token,
+      serverUrl: normalizeServerUrl(process.env.OVERLEAF_SERVER_URL, 'OVERLEAF_SERVER_URL'),
     };
     validateProject(project, 'env vars');
     return { projects: { default: project } };
@@ -224,11 +276,22 @@ const projectsConfig = await loadProjectsConfig();
 
 // Git operations helper
 class OverleafGitClient {
-  constructor(projectId, gitToken) {
-    this.projectId = projectId;
-    this.gitToken = gitToken;
-    this.repoPath = path.join(os.tmpdir(), `overleaf-${projectId}`);
-    this.gitUrl = `https://git.overleaf.com/${projectId}`;
+  constructor(project) {
+    this.projectId = project.projectId;
+    this.gitToken = project.gitToken;
+    if (project.serverUrl) {
+      // Self-hosted instance: git lives at <origin>/git/<projectId>.
+      // The host is part of the local clone path so identical projectIds on
+      // different servers never share a checkout.
+      const { protocol, host } = new URL(project.serverUrl);
+      const safeHost = host.replace(/[^A-Za-z0-9.-]/g, '_');
+      this.repoPath = path.join(os.tmpdir(), `overleaf-${safeHost}-${this.projectId}`);
+      this.cloneUrl = `${protocol}//git:${this.gitToken}@${host}/git/${this.projectId}`;
+    } else {
+      // Official overleaf.com: dedicated git host, historic clone path.
+      this.repoPath = path.join(os.tmpdir(), `overleaf-${this.projectId}`);
+      this.cloneUrl = `https://git:${this.gitToken}@git.overleaf.com/${this.projectId}`;
+    }
   }
 
   // Resolve a caller-supplied path under the repo root, refusing traversal
@@ -253,7 +316,7 @@ class OverleafGitClient {
     } catch {
       // Not cloned yet, do initial clone
       const { stdout } = await exec(
-        `git clone https://git:${this.gitToken}@git.overleaf.com/${this.projectId} "${this.repoPath}"`,
+        `git clone "${this.cloneUrl}" "${this.repoPath}"`,
         { env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }
       );
       // Set a local committer identity so `git commit` works even when global config is absent
@@ -408,7 +471,7 @@ function getProject(projectName = 'default') {
   if (!project) {
     throw new Error(`Project "${projectName}" not found in configuration`);
   }
-  return new OverleafGitClient(project.projectId, project.gitToken);
+  return new OverleafGitClient(project);
 }
 
 // List all projects
@@ -582,6 +645,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           id: key,
           name: project.name,
           projectId: project.projectId,
+          serverUrl: project.serverUrl || 'https://www.overleaf.com',
         }));
         return {
           content: [

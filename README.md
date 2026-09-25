@@ -111,6 +111,27 @@ Use read_file with filePath: "main.tex", projectName: "thesis"
 
 If `projectName` is omitted, the `default` entry is used. To put `projects.json` somewhere other than the standard location, point `OVERLEAF_PROJECTS_CONFIG=/absolute/path/projects.json` at it from the `env` block.
 
+### Selecting projects by regex
+
+The read-only tools (`list_files`, `read_file`, `get_sections`, `get_section_content`, `status_summary`) also accept `projectNamePattern` — a regular expression matched against the configured project keys — to query several projects in one call:
+
+```
+Use status_summary with projectNamePattern: "^paper-"
+```
+
+- Matching is partial — anchor with `^...$` to hit exact keys. The pattern can only select among projects already present in your `projects.json`; Overleaf's git API cannot enumerate an account's projects.
+- `projectNamePattern` is mutually exclusive with `projectName` — pass one or the other.
+- Results come back as a JSON object keyed by project name, even when only one project matches. A project that fails (e.g. expired token) gets an `{ "error": "..." }` value without affecting the others:
+
+```json
+{
+  "paper-a": { "totalFiles": 12, "mainFile": "main.tex", "totalSections": 8, "files": ["..."] },
+  "paper-b": { "error": "Command failed: git clone ..." }
+}
+```
+
+- The write tools (`write_file`, `write_section`) deliberately do **not** accept `projectNamePattern` — batch-pushing the same content into multiple projects is almost never what you want. Use `projectName` to write to exactly one project.
+
 ## Getting Overleaf Credentials
 
 1. **Project ID** — open your Overleaf project; the ID is in the URL: `https://www.overleaf.com/project/[PROJECT_ID]`
@@ -280,26 +301,31 @@ List all configured projects.
 List files in a project (default: .tex files).
 - `extension`: File extension filter (optional)
 - `projectName`: Project identifier (optional, defaults to "default")
+- `projectNamePattern`: Regex matched against configured project keys to query multiple projects at once (optional, mutually exclusive with `projectName`; results grouped by project key)
 
 ### `read_file`
 Read a specific file from the project.
 - `filePath`: Path to the file (required)
 - `projectName`: Project identifier (optional)
+- `projectNamePattern`: Regex for multi-project reads (optional, mutually exclusive with `projectName`)
 
 ### `get_sections`
 Get all sections from a LaTeX file.
 - `filePath`: Path to the LaTeX file (required)
 - `projectName`: Project identifier (optional)
+- `projectNamePattern`: Regex for multi-project reads (optional, mutually exclusive with `projectName`)
 
 ### `get_section_content`
 Get content of a specific section.
 - `filePath`: Path to the LaTeX file (required)
 - `sectionTitle`: Title of the section (required)
 - `projectName`: Project identifier (optional)
+- `projectNamePattern`: Regex for multi-project reads (optional, mutually exclusive with `projectName`)
 
 ### `status_summary`
 Get a comprehensive project status summary.
 - `projectName`: Project identifier (optional)
+- `projectNamePattern`: Regex for multi-project reads (optional, mutually exclusive with `projectName`)
 
 ### `write_file`
 Write the full content of a file to the project.
@@ -333,6 +359,12 @@ Use get_section_content with filePath: "main.tex" and sectionTitle: "Introductio
 
 # List all sections in a file
 Use get_sections with filePath: "main.tex"
+
+# Get status of every configured project whose key starts with "paper-"
+Use status_summary with projectNamePattern: "^paper-"
+
+# Read main.tex from all configured projects (results grouped by project key)
+Use read_file with filePath: "main.tex", projectNamePattern: "."
 
 # Write the full content of a file to the project
 Use write_file with filePath: "main.tex", content: "...", commitMessage: "..."

@@ -34,7 +34,7 @@ npm pack             # 打包成本地 tgz，用于发布前验证 npm 产物
    - 环境变量优先于文件时，会向 stderr 输出遮蔽提示。未找到任何配置时打印可操作的帮助并退出。
    - 每个项目可设可选 `serverUrl`（自托管 Overleaf，如 `https://latex.example.edu`）；`normalizeServerUrl()` 将其归一化为 origin（剥离路径/查询），拒绝非 http(s)、含凭据或空白的值。缺省即官方 overleaf.com。
 3. **`OverleafGitClient`** — 每个项目克隆到 `os.tmpdir()` 下：官方实例用 `overleaf-<projectId>`（历史路径不变），自托管实例用 `overleaf-<host>-<projectId>`（host 参与路径，避免不同服务器上相同 projectId 共用检出）。clone URL：官方 `https://git:<token>@git.overleaf.com/<id>`，自托管 `<origin>/git/<id>`。**每个工具调用都会先 `cloneOrPull()`**（有 `.git` 则 pull，否则 clone），保证读到的是远端最新状态。首次 clone 后设置本地 `user.email`/`user.name`，使无全局 git 配置的环境也能 commit。
-4. **MCP 工具层** — 8 个工具：`list_projects`、`list_files`、`read_file`、`get_sections`、`get_section_content`、`status_summary`、`write_file`、`write_section`。所有工具接受可选 `projectName`（默认 `"default"`）。
+4. **MCP 工具层** — 8 个工具：`list_projects`、`list_files`、`read_file`、`get_sections`、`get_section_content`、`status_summary`、`write_file`、`write_section`。所有工具接受可选 `projectName`（默认 `"default"`）。5 个读工具另接受可选 `projectNamePattern`（与 `projectName` 互斥）：正则匹配已配置的项目键名，经 `resolveProjectKeys()` 解析后由 `runOnMatchedProjects()` 逐项目执行，结果按项目键名分组返回 JSON，单项目失败隔离为 `{error}`。写工具刻意不支持正则——批量 push 多项目风险过高。
 
 ### 关键不变量
 
@@ -42,7 +42,7 @@ npm pack             # 打包成本地 tgz，用于发布前验证 npm 产物
 - **快照一致性** — `getSectionContent`/`writeSection` 用单次 readFile 的内容同时做解析和拼接，避免两次 pull 之间远端变化导致章节偏移错位（TOCTOU）。
 - **写操作流程** — pull → 写文件 → `git add` → `commit` → `push`。push 被 rejected（non-fast-forward）时抛出可重试的错误提示；pull 出 CONFLICT 时提示用户去 Overleaf 解决。所有 git 调用设 `GIT_TERMINAL_PROMPT=0` 防止挂起等待凭据。
 - **writeSection 的替换范围** — 从目标章节起到下一个同级或更高级章节（或 `\end{document}`）为止。章节层级：part < chapter < section < subsection < subsubsection。
-- **令牌安全** — `maskToken()` 把 `https://git:<token>@` 从错误消息中遮蔽后再返回给 MCP 客户端。克隆 URL 中的 token 永不进入工具响应。
+- **令牌安全** — `maskToken()` 把 `https://git:<token>@` 从错误消息中遮蔽后再返回给 MCP 客户端。克隆 URL 中的 token 永不进入工具响应。分组（`projectNamePattern`）模式下逐项目错误进入正常响应体、不经过外层 catch，必须在 `runOnMatchedProjects()` 内显式 `maskToken()`。
 - **路径安全** — `resolveSafePath()` 把工具传入的 `filePath` 限制在克隆目录内，拒绝 `..` 穿越和绝对路径。
 - **projectId 校验** — 配置加载时拒绝空值或含空白字符的 projectId（它同时用作路径组件和 Git URL）。
 

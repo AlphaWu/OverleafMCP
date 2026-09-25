@@ -467,11 +467,87 @@ const server = new Server(
 
 // Helper to get project
 function getProject(projectName = 'default') {
-  const project = projectsConfig.projects[projectName];
+  const project = Object.hasOwn(projectsConfig.projects, projectName)
+    ? projectsConfig.projects[projectName]
+    : undefined;
   if (!project) {
     throw new Error(`Project "${projectName}" not found in configuration`);
   }
   return new OverleafGitClient(project);
+}
+
+// Upper bound for a caller-supplied projectNamePattern — keeps regex cost
+// predictable. Patterns only ever run against local config keys.
+const MAX_PATTERN_LENGTH = 200;
+
+// Shared schema description for the projectNamePattern property on read tools.
+const PROJECT_NAME_PATTERN_DESCRIPTION =
+  'Regex matched against configured project keys to operate on multiple projects at once ' +
+  '(read tools only). Mutually exclusive with projectName. Matches are partial — anchor ' +
+  'with ^...$ for exact keys. Results are returned as a JSON object keyed by project name.';
+
+// Batch git operations against matched projects in chunks of this size, so a
+// wide pattern cannot fire unbounded concurrent git processes (and hit
+// Overleaf rate limits).
+const BATCH_CONCURRENCY = 4;
+
+// Compile a caller-supplied regex and match it against configured project
+// keys. Overleaf's git API cannot enumerate an account's projects, so a
+// pattern can only select among keys already present in the configuration.
+// All errors are thrown before any git/network work, so they are testable
+// without credentials.
+function resolveProjectKeys(pattern) {
+  if (typeof pattern !== 'string' || !pattern.trim()) {
+    throw new Error('projectNamePattern must be a non-empty string');
+  }
+  if (pattern.length > MAX_PATTERN_LENGTH) {
+    throw new Error(`projectNamePattern exceeds ${MAX_PATTERN_LENGTH} characters`);
+  }
+  let re;
+  try {
+    re = new RegExp(pattern);
+  } catch (err) {
+    throw new Error(`Invalid projectNamePattern "${pattern}": ${err.message}`);
+  }
+  const keys = Object.keys(projectsConfig.projects);
+  const matches = keys.filter(k => re.test(k));
+  if (matches.length === 0) {
+    throw new Error(
+      `No configured project matches pattern "${pattern}" — available projects: ${keys.join(', ')}`
+    );
+  }
+  return matches;
+}
+
+// Run fn(client, key) for every project matching args.projectNamePattern and
+// return the grouped MCP response. Per-project failures are isolated into
+// `{ error }` values and masked here — grouped errors land in the normal
+// response body and never pass through the outer catch's maskToken.
+async function runOnMatchedProjects(args, fn) {
+  if (args.projectName && args.projectNamePattern) {
+    throw new Error('projectName and projectNamePattern are mutually exclusive — pass one or the other');
+  }
+  const keys = resolveProjectKeys(args.projectNamePattern);
+  const entries = [];
+  for (let i = 0; i < keys.length; i += BATCH_CONCURRENCY) {
+    const batch = await Promise.all(keys.slice(i, i + BATCH_CONCURRENCY).map(async (key) => {
+      try {
+        const client = new OverleafGitClient(projectsConfig.projects[key]);
+        return [key, await fn(client, key)];
+      } catch (err) {
+        return [key, { error: maskToken(err?.message ?? String(err)) }];
+      }
+    }));
+    entries.push(...batch);
+  }
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(Object.fromEntries(entries), null, 2),
+      },
+    ],
+  };
 }
 
 // List all projects
@@ -494,7 +570,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional, defaults to "default")',
+              description: 'Project identifier (optional, defaults to "default"). Mutually exclusive with projectNamePattern.',
+            },
+            projectNamePattern: {
+              type: 'string',
+              description: PROJECT_NAME_PATTERN_DESCRIPTION,
             },
             extension: {
               type: 'string',
@@ -515,7 +595,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: 'Project identifier (optional). Mutually exclusive with projectNamePattern.',
+            },
+            projectNamePattern: {
+              type: 'string',
+              description: PROJECT_NAME_PATTERN_DESCRIPTION,
             },
           },
           required: ['filePath'],
@@ -533,7 +617,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: 'Project identifier (optional). Mutually exclusive with projectNamePattern.',
+            },
+            projectNamePattern: {
+              type: 'string',
+              description: PROJECT_NAME_PATTERN_DESCRIPTION,
             },
           },
           required: ['filePath'],
@@ -555,7 +643,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: 'Project identifier (optional). Mutually exclusive with projectNamePattern.',
+            },
+            projectNamePattern: {
+              type: 'string',
+              description: PROJECT_NAME_PATTERN_DESCRIPTION,
             },
           },
           required: ['filePath', 'sectionTitle'],
@@ -569,7 +661,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: 'Project identifier (optional). Mutually exclusive with projectNamePattern.',
+            },
+            projectNamePattern: {
+              type: 'string',
+              description: PROJECT_NAME_PATTERN_DESCRIPTION,
             },
           },
         },
@@ -658,6 +754,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'list_files': {
+        if (args.projectNamePattern !== undefined) {
+          return await runOnMatchedProjects(args, async (client) => ({
+            files: await client.listFiles(args.extension || '.tex'),
+          }));
+        }
         const client = getProject(args.projectName);
         const files = await client.listFiles(args.extension || '.tex');
         return {
@@ -671,6 +772,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'read_file': {
+        if (args.projectNamePattern !== undefined) {
+          return await runOnMatchedProjects(args, async (client) => ({
+            content: await client.readFile(args.filePath),
+          }));
+        }
         const client = getProject(args.projectName);
         const content = await client.readFile(args.filePath);
         return {
@@ -684,6 +790,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_sections': {
+        if (args.projectNamePattern !== undefined) {
+          return await runOnMatchedProjects(args, async (client) => ({
+            sections: await client.getSections(args.filePath),
+          }));
+        }
         const client = getProject(args.projectName);
         const sections = await client.getSections(args.filePath);
         return {
@@ -697,6 +808,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_section_content': {
+        if (args.projectNamePattern !== undefined) {
+          return await runOnMatchedProjects(args, async (client) => ({
+            content: await client.getSectionContent(args.filePath, args.sectionTitle),
+          }));
+        }
         const client = getProject(args.projectName);
         const content = await client.getSectionContent(args.filePath, args.sectionTitle);
         return {
@@ -710,6 +826,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'status_summary': {
+        if (args.projectNamePattern !== undefined) {
+          return await runOnMatchedProjects(args, async (client) => {
+            const files = await client.listFiles();
+            const mainFile = files.find(f => f.includes('main.tex')) || files[0];
+            const sections = mainFile ? await client.getSections(mainFile) : [];
+            return {
+              totalFiles: files.length,
+              mainFile,
+              totalSections: sections.length,
+              files: files.slice(0, 10),
+            };
+          });
+        }
         const client = getProject(args.projectName);
         const files = await client.listFiles();
         const mainFile = files.find(f => f.includes('main.tex')) || files[0];
@@ -735,6 +864,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'write_file': {
+        if (args.projectNamePattern !== undefined) {
+          throw new Error('projectNamePattern is not supported by write_file — pass projectName to write to exactly one project');
+        }
         const client = getProject(args.projectName);
         const result = await client.writeFile(args.filePath, args.content, args.commitMessage);
         return {
@@ -748,6 +880,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'write_section': {
+        if (args.projectNamePattern !== undefined) {
+          throw new Error('projectNamePattern is not supported by write_section — pass projectName to write to exactly one project');
+        }
         const client = getProject(args.projectName);
         const result = await client.writeSection(
           args.filePath,
